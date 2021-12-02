@@ -2,6 +2,8 @@
 
 Go API to read Endesa energy meters info.
 
+Ported from Python to Go using https://github.com/trocotronic/edistribucion.
+
 You'll need an account in https://www.edistribucion.com to use this module.
 
 ## Building the command line client
