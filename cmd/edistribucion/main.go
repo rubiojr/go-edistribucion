@@ -1,14 +1,20 @@
 package main
 
 import (
+	"flag"
 	"fmt"
 	"os"
 
 	"github.com/rubiojr/go-edistribucion"
 )
 
+var debug bool
+
 func main() {
+	flag.Parse()
 	client := edistribucion.NewClient(os.Getenv("EDISTRIBUCION_USERNAME"), os.Getenv("EDISTRIBUCION_PASSWORD"))
+	client.Debug = debug
+
 	err := client.Login()
 	if err != nil {
 		panic(err)
@@ -33,5 +39,10 @@ func main() {
 		fmt.Println("Estado ICP: ", mi.EstadoICP)
 		fmt.Println("Totalizador: ", mi.Totalizador)
 	}
+
+}
+
+func init() {
+	flag.BoolVar(&debug, "debug", false, "Enable debug mode")
 
 }
