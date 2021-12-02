@@ -32,3 +32,10 @@ Porcentage:  3,48%
 Estado ICP:  Abierto
 Totalizador:  14.811
 ```
+
+## Related
+
+* https://github.com/azogue/aiopvpc
+* https://github.com/trocotronic/edistribucion
+* https://github.com/uvejota/edistribucion
+* https://github.com/uvejota/homeassistant-edata
