@@ -6,7 +6,6 @@ import (
 	"errors"
 	"fmt"
 	"net/url"
-	"os"
 	"regexp"
 	"strings"
 	"time"
@@ -233,8 +232,8 @@ func (cl *Client) Login() error {
 
 	c.Visit("https://zonaprivada.edistribucion.com/areaprivada/s/login?ec=302&startURL=%2Fareaprivada%2Fs%2F")
 	params := map[string]string{
-		"username": os.Getenv("EDISTRIBUCION_USERNAME"),
-		"password": os.Getenv("EDISTRIBUCION_PASSWORD"),
+		"username": cl.username,
+		"password": cl.password,
 		"startUrl": "/areaprivada/s/",
 	}
 
