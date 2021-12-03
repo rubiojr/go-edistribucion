@@ -21,16 +21,17 @@ func main() {
 }
 
 func run() error {
-	dsn := flag.String("db", "", "database file")
+	dbpath := flag.String("db", "", "database file")
+	pause := flag.Int("sleep", 60, "pause X minutes between queries")
 	flag.Parse()
-	if *dsn == "" {
+	if *dbpath == "" {
 		flag.Usage()
 		return fmt.Errorf("required: -db")
 	}
 
 	// Open database file.
 	var err error
-	db, err = sql.Open("sqlite3", *dsn)
+	db, err = sql.Open("sqlite3", *dbpath)
 	if err != nil {
 		return err
 	}
@@ -62,8 +63,8 @@ func run() error {
 				fmt.Fprintf(os.Stderr, "%s\n", err)
 			}
 		}
-		fmt.Println("Sleeping for 6 hours...")
-		time.Sleep(6 * time.Hour)
+		fmt.Printf("Sleeping for %d minutes...\n", *pause)
+		time.Sleep(time.Duration(*pause) * time.Minute)
 	}
 }
 
