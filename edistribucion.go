@@ -1,4 +1,5 @@
 // Porting https://github.com/trocotronic/edistribucion to Go
+
 package edistribucion
 
 import (
@@ -204,7 +205,7 @@ func (c *Client) MeterInfo(cupsID string) (*MeterInfo, error) {
 
 func NewClient(username, password string) *Client {
 	c := colly.NewCollector()
-	c.SetRequestTimeout(60 * time.Second)
+	c.SetRequestTimeout(90 * time.Second)
 	c.UserAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/70.0.3538.77 Safari/537.36"
 	return &Client{username: username, password: password, collector: c}
 }

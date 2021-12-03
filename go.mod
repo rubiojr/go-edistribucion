@@ -2,7 +2,10 @@ module github.com/rubiojr/go-edistribucion
 
 go 1.17
 
-require github.com/gocolly/colly v1.2.0
+require (
+	github.com/gocolly/colly v1.2.0
+	github.com/mattn/go-sqlite3 v1.14.9
+)
 
 require (
 	github.com/PuerkitoBio/goquery v1.8.0 // indirect
