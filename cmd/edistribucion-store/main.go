@@ -47,24 +47,29 @@ func run() error {
 	for {
 		err := client.Login()
 		if err != nil {
-			continue
+			fmt.Println("Login error, retrying: ", err)
+		} else {
+			readCups(client)
 		}
 
-		allCups, err := client.ListCups()
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "Error listing cups: %s\n", err)
-			os.Exit(1)
-		}
-
-		for _, cups := range allCups {
-			fmt.Println("Reading data from CUPS in ", cups.ProvisioningAddress)
-			err = insertData(client, &cups)
-			if err != nil {
-				fmt.Fprintf(os.Stderr, "%s\n", err)
-			}
-		}
-		fmt.Printf("Sleeping for %d minutes...\n", *pause)
+		fmt.Printf("Sleeping %d minutes...\n", *pause)
 		time.Sleep(time.Duration(*pause) * time.Minute)
+	}
+}
+
+func readCups(client *edistribucion.Client) {
+	allCups, err := client.ListCups()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error listing cups: %s\n", err)
+		os.Exit(1)
+	}
+
+	for _, cups := range allCups {
+		fmt.Println("Reading data from CUPS in ", cups.ProvisioningAddress)
+		err = insertData(client, &cups)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "%s\n", err)
+		}
 	}
 }
 

@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/gocolly/colly"
+	"github.com/gocolly/colly/storage"
 )
 
 const dashboardURL = "https://zonaprivada.edistribucion.com/areaprivada/s/sfsites/aura?"
@@ -212,6 +213,7 @@ func NewClient(username, password string) *Client {
 
 func (cl *Client) Login() error {
 	c := cl.collector
+	c.SetStorage(&storage.InMemoryStorage{})
 	cl.ctx = &Context{}
 	c.OnHTML("script", func(e *colly.HTMLElement) {
 		path := e.Attr("src")
