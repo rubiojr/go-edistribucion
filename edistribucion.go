@@ -6,34 +6,67 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"html"
+	"net/http"
 	"net/url"
 	"regexp"
 	"strings"
+	"sync/atomic"
 	"time"
 
-	"github.com/gocolly/colly"
-	"github.com/gocolly/colly/storage"
+	"github.com/gocolly/colly/v2"
+	"github.com/gocolly/colly/v2/storage"
 )
 
-const dashboardURL = "https://zonaprivada.edistribucion.com/areaprivada/s/sfsites/aura?"
+const (
+	hostURL      = "https://zonaprivada.edistribucion.com"
+	siteURL      = hostURL + "/areaprivada/s"
+	loginURL     = siteURL + "/login?ec=302&startURL=%2Fareaprivada%2Fs%2F"
+	dashboardURL = siteURL + "/sfsites/aura?"
+)
 
-var auraConfig AuraConfig
+var (
+	resourcesScriptPattern = regexp.MustCompile(`(?i)(?:src|data-href)=["']([^"']*resources\.js[^"']*)`)
+	javascriptRedirect     = regexp.MustCompile(`window\.location\.replace\(["']([^"']+)["']\)`)
+	tokenCookiePattern     = regexp.MustCompile(`["']?eikoo[ck]nekot["']?\s*:\s*["']([^"']+)["']`)
+)
 
 type Context struct {
-	Mode       string `json:"mode"`
-	App        string `json:"app"`
-	Fwuid      string `json:"fwuid"`
-	Loaded     Loaded `json:"loaded"`
-	Apce       uint   `json:"apce"`
-	Apck       string `json:"apck"`
-	Mlr        uint   `json:"mlr"`
-	PathPrefix string `json:"pathPrefix"`
-	Dns        string `json:"dns"`
-	Ls         uint   `json:"ls"`
+	Mode       string         `json:"mode"`
+	App        string         `json:"app"`
+	Fwuid      string         `json:"fwuid"`
+	Loaded     Loaded         `json:"loaded"`
+	DN         []any          `json:"dn"`
+	Globals    map[string]any `json:"globals"`
+	UAD        bool           `json:"uad"`
+	Apce       uint           `json:"apce,omitempty"`
+	Apck       string         `json:"apck,omitempty"`
+	Mlr        uint           `json:"mlr,omitempty"`
+	PathPrefix string         `json:"pathPrefix,omitempty"`
+	Dns        string         `json:"dns,omitempty"`
+	Ls         uint           `json:"ls,omitempty"`
 }
 
 type Loaded struct {
-	Token string `json:"APPLICATION@markup://siteforce:loginApp2"`
+	Token  string `json:"APPLICATION@markup://siteforce:loginApp2,omitempty"`
+	values map[string]string
+}
+
+func (l *Loaded) UnmarshalJSON(data []byte) error {
+	if err := json.Unmarshal(data, &l.values); err != nil {
+		return err
+	}
+	l.Token = l.values["APPLICATION@markup://siteforce:loginApp2"]
+	return nil
+}
+
+func (l Loaded) MarshalJSON() ([]byte, error) {
+	if l.values != nil {
+		return json.Marshal(l.values)
+	}
+	return json.Marshal(map[string]string{
+		"APPLICATION@markup://siteforce:loginApp2": l.Token,
+	})
 }
 
 type Action struct {
@@ -55,7 +88,18 @@ type Message struct {
 }
 
 type LoginResponse struct {
-	Events []Event `json:"events"`
+	Events  []Event         `json:"events"`
+	Actions []ActionOutcome `json:"actions"`
+}
+
+type ActionOutcome struct {
+	State       string          `json:"state"`
+	ReturnValue json.RawMessage `json:"returnValue"`
+	Error       []ActionError   `json:"error"`
+}
+
+type ActionError struct {
+	Message string `json:"message"`
 }
 
 type Event struct {
@@ -158,22 +202,22 @@ type MeterWarning struct {
 }
 
 var actions = map[string]Action{
-	"getLoginInfo": Action{
+	"getLoginInfo": {
 		ID:                215,
-		Descriptor:        "WP_Monitor_CTRL/ACTION$getLoginInfo",
-		CallingDescriptor: "WP_Monitor",
+		Descriptor:        "apex://WP_Monitor_CTRL/ACTION$getLoginInfo",
+		CallingDescriptor: "markup://c:WP_Monitor",
 		Params:            map[string]string{"serviceNumber": "S011"},
 	},
-	"getCups": Action{
+	"getCups": {
 		ID:                270,
-		Descriptor:        "WP_ContadorICP_F2_CTRL/ACTION$getCUPSReconectarICP",
-		CallingDescriptor: "WP_Reconnect_ICP",
+		Descriptor:        "apex://WP_ContadorICP_F2_CTRL/ACTION$getCUPSReconectarICP",
+		CallingDescriptor: "markup://c:WP_Reconnect_ICP",
 		Params:            map[string]string{"visSelected": ""},
 	},
-	"getMeter": Action{
-		ID:                294,
-		Descriptor:        "WP_ContadorICP_F2_CTRL/ACTION$consultarContador",
-		CallingDescriptor: "WP_Reconnect_Detail",
+	"getMeter": {
+		ID:                522,
+		Descriptor:        "apex://WP_ContadorICP_F2_CTRL/ACTION$consultarContador2",
+		CallingDescriptor: "markup://c:WP_Reconnect_Detail",
 		Params:            map[string]string{"cupsId": ""},
 	},
 }
@@ -183,17 +227,21 @@ type Client struct {
 	password  string
 	collector *colly.Collector
 	ctx       *Context
+	token     string
 	accountID string
+	requestID atomic.Uint64
 	Debug     bool
 }
 
 func (c *Client) MeterInfo(cupsID string) (*MeterInfo, error) {
 	var met MeterActionResponse
-	getMeter := actions["getMeter"]
-	getMeter.Params["cupsId"] = cupsID
-	err := c.sendAction(getMeter, "WP_ContadorICP_F2_CTRL.consultarContador", &met)
+	getMeter := actionWithParam(actions["getMeter"], "cupsId", cupsID)
+	err := c.sendAction(getMeter, "WP_ContadorICP_F2_CTRL.consultarContador2", &met)
 	if err != nil {
 		return nil, err
+	}
+	if len(met.Actions) == 0 {
+		return nil, errors.New("meter response contains no actions")
 	}
 
 	rv := met.Actions[0].MeterReturnValue
@@ -206,100 +254,57 @@ func (c *Client) MeterInfo(cupsID string) (*MeterInfo, error) {
 
 func NewClient(username, password string) *Client {
 	c := colly.NewCollector()
+	c.AllowURLRevisit = true
 	c.SetRequestTimeout(90 * time.Second)
-	c.UserAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/70.0.3538.77 Safari/537.36"
+	c.SetRedirectHandler(func(req *http.Request, _ []*http.Request) error {
+		return validateRemoteURL(req.URL)
+	})
+	c.UserAgent = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36"
 	return &Client{username: username, password: password, collector: c}
 }
 
 func (cl *Client) Login() error {
-	c := cl.collector
-	c.SetStorage(&storage.InMemoryStorage{})
-	cl.ctx = &Context{}
-	c.OnHTML("script", func(e *colly.HTMLElement) {
-		path := e.Attr("src")
-		if regexp.MustCompile(`resources.js`).MatchString(path) {
-			j := strings.Split(path, "/")[5]
-			decoded, err := url.QueryUnescape(j)
-			if err != nil {
-				panic(err)
-			}
-
-			//var data map[string]string
-			err = json.Unmarshal([]byte(decoded), cl.ctx)
-			if err != nil {
-				panic(err)
-			}
-
-		}
-	})
-
-	c.Visit("https://zonaprivada.edistribucion.com/areaprivada/s/login?ec=302&startURL=%2Fareaprivada%2Fs%2F")
-	params := map[string]string{
-		"username": cl.username,
-		"password": cl.password,
-		"startUrl": "/areaprivada/s/",
+	if err := cl.collector.SetStorage(&storage.InMemoryStorage{}); err != nil {
+		return fmt.Errorf("initialize session storage: %w", err)
 	}
+	cl.ctx = nil
+	cl.token = ""
+	cl.accountID = ""
+	cl.requestID.Store(0)
 
-	action := Action{
-		ID:                91,
-		Descriptor:        "LightningLoginFormController/ACTION$login",
-		CallingDescriptor: "WP_LoginForm",
-		Params:            params,
+	// Salesforce initializes the session proxy on the site root before login.
+	if _, err := cl.visit(siteURL); err != nil {
+		return fmt.Errorf("initialize login session: %w", err)
 	}
-
-	msg := Message{[]Action{action}}
-
-	//d := Data{Message: msg, Context: ctx, Token: "undefined", PageURI: "/areaprivada/s/login/?language=es&startURL=%2Fareaprivada%2Fs%2F&ec=302"}
-	msgm, err := json.Marshal(msg)
+	loginPage, err := cl.visit(loginURL)
 	if err != nil {
-		panic(err)
+		return fmt.Errorf("load login page: %w", err)
 	}
-	ctxm, err := json.Marshal(cl.ctx)
+	cl.ctx, err = parseAuraContext(loginPage)
 	if err != nil {
-		panic(err)
+		return fmt.Errorf("load login context: %w", err)
 	}
 
-	d := map[string]string{
-		"message":      string(msgm),
-		"aura.context": string(ctxm),
-		"aura.pageURI": "/areaprivada/s/login/?language=es&startURL=%2Fareaprivada%2Fs%2F&ec=302",
-		"aura.token":   "undefined",
-	}
-
-	var response LoginResponse
-	c.OnResponse(func(r *colly.Response) {
-		json.Unmarshal(r.Body, &response)
-	})
-
-	err = c.Post("https://zonaprivada.edistribucion.com/areaprivada/s/sfsites/aura?other.LightningLoginForm.login=1", d)
+	response, err := cl.submitLogin()
 	if err != nil {
 		return err
 	}
-
 	if len(response.Events) == 0 {
-		return errors.New("invalid login response")
+		return loginResponseError(response)
+	}
+	if _, err := cl.visit(response.Events[0].Attributes.Values.Url); err != nil {
+		return fmt.Errorf("follow login redirect: %w", err)
 	}
 
-	c = c.Clone()
-	c.OnResponse(func(r *colly.Response) {
-		// TODO: add debugging
-		//fmt.Println(string(r.Body))
-	})
-
-	// Follow the redirect after login
-	err = c.Visit(response.Events[0].Attributes.Values.Url)
+	landingPage, err := cl.visit(siteURL)
 	if err != nil {
-		return err
+		return fmt.Errorf("load landing page: %w", err)
 	}
-
-	c = c.Clone()
-	c.OnResponse(func(r *colly.Response) {
-		p := regexpGroups(`(?P<auraConfig>var auraConfig = )(?P<json>.*?);`, string(r.Body))
-		json.Unmarshal([]byte(p["json"]), &auraConfig)
-	})
-
-	// Landing page
-	err = c.Visit("https://zonaprivada.edistribucion.com/areaprivada/s/")
+	cl.ctx, err = parseAuraContext(landingPage)
+	if err != nil {
+		return fmt.Errorf("load authenticated context: %w", err)
+	}
+	cl.token, err = cl.auraToken(landingPage)
 	if err != nil {
 		return err
 	}
@@ -311,26 +316,73 @@ func (cl *Client) Login() error {
 		return err
 	}
 
+	if len(ar.Actions) == 0 {
+		return errors.New("login info response contains no actions")
+	}
 	cl.accountID = ar.Actions[0].ReturnValue.Visibility.ID
+	if cl.accountID == "" {
+		return errors.New("login info response contains no account ID")
+	}
 
 	return nil
 }
 
+func (cl *Client) submitLogin() (LoginResponse, error) {
+	action := Action{
+		ID:                91,
+		Descriptor:        "apex://LightningLoginFormController/ACTION$login",
+		CallingDescriptor: "markup://c:WP_LoginForm",
+		Params: map[string]string{
+			"username": cl.username,
+			"password": cl.password,
+			"startUrl": "/areaprivada/s/",
+		},
+	}
+	msg, err := json.Marshal(Message{Actions: []Action{action}})
+	if err != nil {
+		return LoginResponse{}, fmt.Errorf("encode login message: %w", err)
+	}
+	ctx, err := json.Marshal(cl.ctx)
+	if err != nil {
+		return LoginResponse{}, fmt.Errorf("encode login context: %w", err)
+	}
+	data := map[string]string{
+		"message":      string(msg),
+		"aura.context": string(ctx),
+		"aura.pageURI": "/areaprivada/s/login/?language=es&startURL=%2Fareaprivada%2Fs%2F&ec=302",
+		"aura.token":   "null",
+	}
+	body, err := cl.post(dashboardURL+"r=1&other.LightningLoginForm.login=1", data)
+	if err != nil {
+		return LoginResponse{}, fmt.Errorf("submit login: %w", err)
+	}
+
+	var response LoginResponse
+	if err := json.Unmarshal(body, &response); err != nil {
+		return LoginResponse{}, fmt.Errorf("decode login response: %w", err)
+	}
+	return response, nil
+}
+
 func (c *Client) ListCups() ([]Cups, error) {
 	var gc CupsActionResponse
-	getCups := actions["getCups"]
-	getCups.Params["visSelected"] = c.accountID
+	getCups := actionWithParam(actions["getCups"], "visSelected", c.accountID)
 	err := c.sendAction(getCups, "WP_ContadorICP_F2_CTRL.getCUPSReconectarICP", &gc)
 	if err != nil {
 		return nil, err
+	}
+	if len(gc.Actions) == 0 {
+		return nil, errors.New("CUPS response contains no actions")
 	}
 
 	return gc.Actions[0].CupsReturnValue.Data.Cups, nil
 }
 
 func (client *Client) sendAction(action Action, command string, actionResponse interface{}) error {
+	if client.ctx == nil || client.token == "" {
+		return errors.New("client is not logged in")
+	}
 	ctx := client.ctx
-	c := client.collector.Clone()
 	msg := Message{[]Action{action}}
 	msgm, err := json.Marshal(msg)
 	if err != nil {
@@ -344,39 +396,187 @@ func (client *Client) sendAction(action Action, command string, actionResponse i
 	d := map[string]string{
 		"message":      string(msgm),
 		"aura.context": string(ctxm),
-		"aura.pageURI": "/areaprivada/s/wp-online-access",
-		"aura.token":   auraConfig.Token,
+		"aura.pageURI": "/areaprivada/s/",
+		"aura.token":   client.token,
 	}
-	c.OnRequest(func(r *colly.Request) {
-		r.Headers.Set("Accept", "application/json")
-	})
-
-	c.OnResponse(func(r *colly.Response) {
-		if strings.HasPrefix(r.Headers.Get("Content-Type"), "application/json") {
-			if client.Debug {
-				fmt.Println(string(r.Body))
-			}
-			json.Unmarshal(r.Body, actionResponse)
-		}
-	})
-
-	err = c.Post(dashboardURL+command, d)
+	requestID := client.requestID.Add(1) - 1
+	body, err := client.post(fmt.Sprintf("%sr=%d&other.%s=1", dashboardURL, requestID, command), d)
 	if err != nil {
 		return err
+	}
+	if err := validateActionResponse(body); err != nil {
+		return err
+	}
+	if err := json.Unmarshal(body, actionResponse); err != nil {
+		return fmt.Errorf("decode action response: %w", err)
 	}
 
 	return nil
 }
 
-func regexpGroups(regEx, url string) (paramsMap map[string]string) {
-	var compRegEx = regexp.MustCompile(regEx)
-	match := compRegEx.FindStringSubmatch(url)
+func actionWithParam(action Action, key, value string) Action {
+	params := make(map[string]string, len(action.Params))
+	for name, param := range action.Params {
+		params[name] = param
+	}
+	params[key] = value
+	action.Params = params
+	return action
+}
 
-	paramsMap = make(map[string]string)
-	for i, name := range compRegEx.SubexpNames() {
-		if i > 0 && i <= len(match) {
-			paramsMap[name] = match[i]
+func (client *Client) post(rawURL string, data map[string]string) ([]byte, error) {
+	c := client.collector.Clone()
+	var body []byte
+	c.OnRequest(func(r *colly.Request) {
+		r.Headers.Set("Accept", "application/json")
+	})
+	c.OnResponse(func(r *colly.Response) {
+		body = append(body[:0], r.Body...)
+	})
+	if err := c.Post(rawURL, data); err != nil {
+		return nil, err
+	}
+	if client.Debug {
+		fmt.Println(string(body))
+	}
+	return body, nil
+}
+
+func (client *Client) visit(rawURL string) ([]byte, error) {
+	const maxJavaScriptRedirects = 5
+	for range maxJavaScriptRedirects + 1 {
+		current, err := url.Parse(rawURL)
+		if err != nil {
+			return nil, err
+		}
+		if err := validateRemoteURL(current); err != nil {
+			return nil, err
+		}
+		c := client.collector.Clone()
+		var body []byte
+		c.OnResponse(func(r *colly.Response) {
+			body = append(body[:0], r.Body...)
+		})
+		if err := c.Visit(rawURL); err != nil {
+			return nil, err
+		}
+
+		redirect := javascriptRedirect.FindSubmatch(body)
+		if redirect == nil {
+			return body, nil
+		}
+		next, err := current.Parse(html.UnescapeString(string(redirect[1])))
+		if err != nil {
+			return nil, fmt.Errorf("parse JavaScript redirect: %w", err)
+		}
+		rawURL = next.String()
+	}
+	return nil, errors.New("too many JavaScript redirects")
+}
+
+func validateRemoteURL(remoteURL *url.URL) error {
+	if remoteURL.Scheme != "https" {
+		return fmt.Errorf("refusing non-HTTPS URL %q", remoteURL.String())
+	}
+	host := strings.ToLower(remoteURL.Hostname())
+	if host == "zonaprivada.edistribucion.com" ||
+		strings.HasSuffix(host, ".salesforce.com") ||
+		strings.HasSuffix(host, ".force.com") ||
+		strings.HasSuffix(host, ".salesforce-sites.com") ||
+		strings.HasSuffix(host, ".salesforce-experience.com") {
+		return nil
+	}
+	return fmt.Errorf("refusing URL on unexpected host %q", host)
+}
+
+func parseAuraContext(page []byte) (*Context, error) {
+	match := resourcesScriptPattern.FindSubmatch(page)
+	if match == nil {
+		return nil, errors.New("resources.js context not found")
+	}
+	decoded, err := url.PathUnescape(html.UnescapeString(string(match[1])))
+	if err != nil {
+		return nil, fmt.Errorf("decode resources.js URL: %w", err)
+	}
+	resourceIndex := strings.Index(decoded, "/resources.js")
+	if resourceIndex < 0 {
+		return nil, errors.New("invalid resources.js URL")
+	}
+	encodedContext := decoded[:resourceIndex]
+	start := strings.IndexByte(encodedContext, '{')
+	end := strings.LastIndexByte(encodedContext, '}')
+	if start < 0 || end < start {
+		return nil, errors.New("aura context JSON not found")
+	}
+
+	var bootstrap Context
+	if err := json.Unmarshal([]byte(encodedContext[start:end+1]), &bootstrap); err != nil {
+		return nil, fmt.Errorf("decode Aura context: %w", err)
+	}
+	if bootstrap.Mode == "" || bootstrap.App == "" || bootstrap.Fwuid == "" || bootstrap.Loaded.values == nil {
+		return nil, errors.New("aura context is incomplete")
+	}
+	bootstrap.DN = []any{}
+	bootstrap.Globals = map[string]any{}
+	bootstrap.UAD = false
+	bootstrap.Apce = 0
+	bootstrap.Apck = ""
+	bootstrap.Mlr = 0
+	bootstrap.PathPrefix = ""
+	bootstrap.Dns = ""
+	bootstrap.Ls = 0
+	return &bootstrap, nil
+}
+
+func (client *Client) auraToken(page []byte) (string, error) {
+	match := tokenCookiePattern.FindSubmatch(page)
+	if match == nil {
+		return "", errors.New("aura token cookie name not found")
+	}
+	name := string(match[1])
+	for _, cookie := range client.collector.Cookies(siteURL) {
+		if cookie.Name == name && cookie.Value != "" {
+			return cookie.Value, nil
 		}
 	}
-	return paramsMap
+	return "", fmt.Errorf("aura token cookie %q not found", name)
+}
+
+func loginResponseError(response LoginResponse) error {
+	for _, action := range response.Actions {
+		for _, actionErr := range action.Error {
+			if actionErr.Message != "" {
+				return fmt.Errorf("login failed: %s", actionErr.Message)
+			}
+		}
+		var message string
+		if json.Unmarshal(action.ReturnValue, &message) == nil && message != "" {
+			return fmt.Errorf("login failed: %s", message)
+		}
+	}
+	return errors.New("login response contains no redirect event")
+}
+
+func validateActionResponse(body []byte) error {
+	var response struct {
+		Actions []ActionOutcome `json:"actions"`
+	}
+	if err := json.Unmarshal(body, &response); err != nil {
+		return fmt.Errorf("decode action response: %w", err)
+	}
+	if len(response.Actions) == 0 {
+		return errors.New("action response contains no actions")
+	}
+	for _, action := range response.Actions {
+		if action.State == "SUCCESS" {
+			continue
+		}
+		for _, actionErr := range action.Error {
+			if actionErr.Message != "" {
+				return fmt.Errorf("action failed: %s", actionErr.Message)
+			}
+		}
+		return fmt.Errorf("action failed with state %q", action.State)
+	}
+	return nil
 }
