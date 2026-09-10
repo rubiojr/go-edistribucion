@@ -1,3 +1,5 @@
 /.env
 /bin
 edistribucion.sqlite
+/edistribucion
+/.octmp
